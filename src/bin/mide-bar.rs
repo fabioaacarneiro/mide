@@ -212,6 +212,8 @@ enum MenuId {
     Control,
     /// Engrenagem: abre as Configurações (não é menu).
     Gear,
+    /// Tocando Agora (B29): o player de música ou vídeo, com capa e controles.
+    NowPlaying,
     /// Confirmações do menu do mide.
     ConfirmRestart,
     ConfirmShutdown,
@@ -223,7 +225,15 @@ impl MenuId {
     fn custom(self) -> bool {
         matches!(
             self,
-            MenuId::Calendar | MenuId::Sound | MenuId::Wifi | MenuId::Bluetooth | MenuId::Control | MenuId::ConfirmRestart | MenuId::ConfirmShutdown | MenuId::ConfirmLogout
+            MenuId::Calendar
+                | MenuId::Sound
+                | MenuId::Wifi
+                | MenuId::Bluetooth
+                | MenuId::Control
+                | MenuId::NowPlaying
+                | MenuId::ConfirmRestart
+                | MenuId::ConfirmShutdown
+                | MenuId::ConfirmLogout
         )
     }
 
@@ -235,7 +245,7 @@ impl MenuId {
     fn custom_width(self) -> f32 {
         match self {
             MenuId::Wifi | MenuId::ConfirmRestart | MenuId::ConfirmShutdown | MenuId::ConfirmLogout => 300.0,
-            MenuId::Control => 320.0,
+            MenuId::Control | MenuId::NowPlaying => 320.0,
             _ => 280.0,
         }
     }
@@ -271,6 +281,15 @@ enum PanelAction {
     AudioInput(usize),
     /// Central de notificações: aviso clicado (índice no histórico).
     Notification(usize),
+    /// Tocando Agora: escolher o player (índice na lista), anterior, tocar/pausar,
+    /// próxima, o trilho da posição, o trilho do volume do player e abrir o app.
+    NpPlayer(usize),
+    NpPrevious,
+    NpPlayPause,
+    NpNext,
+    NpSeek,
+    NpVolume,
+    NpRaise,
 }
 
 /// Títulos dos menus do app, depois do nome dele.
@@ -346,7 +365,7 @@ fn menu_items(id: MenuId, app: &str) -> Vec<MenuItem> {
         // Itens vêm do app (`Bar::native_items`).
         MenuId::Native(_) | MenuId::Tray(_) => Vec::new(),
         // Painéis desenhados à parte (e a engrenagem, que não é menu): sem itens de lista.
-        MenuId::Calendar | MenuId::Sound | MenuId::Wifi | MenuId::Bluetooth | MenuId::Control | MenuId::Gear => Vec::new(),
+        MenuId::Calendar | MenuId::Sound | MenuId::Wifi | MenuId::Bluetooth | MenuId::Control | MenuId::Gear | MenuId::NowPlaying => Vec::new(),
         MenuId::ConfirmRestart | MenuId::ConfirmShutdown | MenuId::ConfirmLogout => Vec::new(),
     }
 }
@@ -406,6 +425,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         tray_items: Vec::new(),
         tray_version: u64::MAX,
         tray_icons: HashMap::new(),
+        mpris: mide::mpris::start(),
+        mpris_version: u64::MAX,
+        np: None,
+        np_players: Vec::new(),
+        np_images: HashMap::new(),
+        np_logged: String::new(),
+        np_scroll_from: std::time::Instant::now(),
+        np_position_read: std::time::Instant::now(),
+        np_second: -1,
         native: None,
         native_gtk: None,
         layout_active: None,
@@ -510,12 +538,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .insert_source(Timer::from_duration(Duration::from_millis(50)), move |_, _, bar| {
             bar.refresh_launcher();
             bar.refresh_tray();
+            let scrolling = bar.refresh_now_playing();
             if last_refresh.elapsed() >= Duration::from_millis(450) {
                 bar.refresh();
                 last_refresh = std::time::Instant::now();
             }
             let animating = bar.step_launcher_fade();
-            let animating = bar.step_tone() || animating;
+            let animating = bar.step_tone() || animating || scrolling;
             TimeoutAction::ToDuration(Duration::from_millis(if animating { 16 } else { 50 }))
         })
         .map_err(|e| e.to_string())?;
@@ -535,8 +564,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 /// Nomes de apps a partir dos `.desktop`, indexados pelos ids possíveis do app_id.
 struct AppNames {
-    /// Nome e comando (`Exec` sem códigos de campo) pelo app_id.
-    by_id: HashMap<String, (String, String)>,
+    /// Nome, comando (`Exec` sem códigos de campo) e ícone pelo app_id.
+    by_id: HashMap<String, (String, String, String)>,
 }
 
 impl AppNames {
@@ -548,6 +577,7 @@ impl AppNames {
                 continue;
             };
             let exec = mide::apps::clean_exec(entry.exec().unwrap_or(""));
+            let icon = entry.icon().unwrap_or("").to_string();
             let id = entry.id().to_string();
             let mut ids = vec![id.to_lowercase()];
             if let Some(last) = id.rsplit('.').next() {
@@ -557,18 +587,23 @@ impl AppNames {
                 ids.push(class.to_lowercase());
             }
             for key in ids {
-                by_id.entry(key).or_insert_with(|| (name.clone(), exec.clone()));
+                by_id.entry(key).or_insert_with(|| (name.clone(), exec.clone(), icon.clone()));
             }
         }
         Self { by_id }
     }
 
     fn name_for(&self, app_id: &str) -> Option<String> {
-        self.by_id.get(&app_id.to_lowercase()).map(|(name, _)| name.clone())
+        self.by_id.get(&app_id.to_lowercase()).map(|(name, ..)| name.clone())
     }
 
     fn exec_for(&self, app_id: &str) -> Option<String> {
-        self.by_id.get(&app_id.to_lowercase()).map(|(_, exec)| exec.clone()).filter(|e| !e.is_empty())
+        self.by_id.get(&app_id.to_lowercase()).map(|(_, exec, _)| exec.clone()).filter(|e| !e.is_empty())
+    }
+
+    /// Ícone (`Icon=`) do app, se o `.desktop` tiver.
+    fn icon_for(&self, app_id: &str) -> Option<String> {
+        self.by_id.get(&app_id.to_lowercase()).map(|(_, _, icon)| icon.clone()).filter(|i| !i.is_empty())
     }
 }
 
@@ -663,6 +698,8 @@ struct Menu {
     dragging_volume: bool,
     /// Arrastando o trilho do brilho (central de controle).
     dragging_brightness: bool,
+    /// Tocando Agora: arrastando a posição ou o volume do player, e o valor (0 a 1).
+    dragging_np: Option<(PanelAction, f32)>,
     /// Topo do painel na tela (abaixo da barra; as confirmações ficam no meio).
     panel_top: f32,
 }
@@ -894,6 +931,21 @@ struct Bar {
     tray_items: Vec<mide::tray::TrayItem>,
     tray_version: u64,
     tray_icons: HashMap<String, Option<Pixmap>>,
+    /// Tocando Agora (B29): os players (MPRIS), a versão vista, o principal e a lista,
+    /// e as imagens já preparadas (ícones dos apps e capas, pela chave).
+    mpris: Option<mide::mpris::Mpris>,
+    mpris_version: u64,
+    np: Option<mide::mpris::Player>,
+    np_players: Vec<mide::mpris::Player>,
+    np_images: HashMap<String, Option<Pixmap>>,
+    /// O que foi registrado no log por último (para registrar só mudanças).
+    np_logged: String,
+    /// Começo da rolagem do título na barra (troca de música recomeça).
+    np_scroll_from: std::time::Instant,
+    /// Último pedido da posição ao player (com o painel aberto, a cada poucos segundos).
+    np_position_read: std::time::Instant,
+    /// Segundo mostrado no painel (redesenha quando muda).
+    np_second: i64,
     native: Option<(String, String, Vec<mide::appmenu::Item>)>,
     /// Layout de teclado ativo (número na lista das Configurações), quando o seletor
     /// aparece na barra.
@@ -1777,6 +1829,7 @@ impl Bar {
             menu.hover_region = None;
             menu.dragging_volume = false;
             menu.dragging_brightness = false;
+            menu.dragging_np = None;
             menu.panel_top = PANEL_TOP;
             self.draw_menu();
             self.draw_bar();
@@ -1807,6 +1860,7 @@ impl Bar {
             panel_top: PANEL_TOP,
             dragging_volume: false,
             dragging_brightness: false,
+            dragging_np: None,
         });
         self.draw_bar();
     }

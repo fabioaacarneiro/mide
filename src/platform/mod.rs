@@ -10,6 +10,7 @@ pub mod appearance;
 pub mod login_items;
 pub mod elevate;
 pub mod portal;
+pub mod mpris;
 
 // No framework mide-ui (github.com/fabioaacarneiro/mide-ui), repassados aqui.
 pub use mide_ui::platform::{control_client, settings_file, sounds};
